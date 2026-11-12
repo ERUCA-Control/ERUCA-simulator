@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-12",
+  "engine": "RocketPy 1.13.0",
+  "solver": "RK45",
+  "physics_behavior_tests_passed": 8,
+  "headless_viewer_tests_passed": 3,
+  "native_gui_launch_verified": false,
+  "windows_launcher_run_verified": false,
+  "note": "Native Tk window creation was blocked by the macOS application-registration restriction in the execution sandbox. The actual numerical engine, chart renderer, seeking and event display logic were exercised. Example inputs are fictional."
+}

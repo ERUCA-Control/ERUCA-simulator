@@ -1,0 +1,54 @@
+{
+  "label": "Fictional demonstration vehicle — replace with measured data",
+  "rocket_mass_kg": 4.0,
+  "rocket_radius_m": 0.045,
+  "rocket_length_m": 1.5,
+  "rocket_inertia_kg_m2": [
+    0.65,
+    0.65,
+    0.007
+  ],
+  "cg_from_tail_m": 0.82,
+  "drag_coefficient": 0.55,
+  "motor_dry_mass_kg": 0.4,
+  "propellant_mass_kg": 0.3,
+  "thrust_curve": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      0.08,
+      300.0
+    ],
+    [
+      0.3,
+      270.0
+    ],
+    [
+      1.6,
+      250.0
+    ],
+    [
+      1.8,
+      0.0
+    ]
+  ],
+  "thrust_scale": 1.0,
+  "wind_east_mps": 2.0,
+  "wind_north_mps": 0.0,
+  "launch_elevation_deg": 85.0,
+  "heading_deg": 0.0,
+  "rail_length_m": 3.0,
+  "latitude_deg": 37.0,
+  "longitude_deg": 127.0,
+  "site_elevation_m": 100.0,
+  "parachute_cd_s_m2": 1.2,
+  "trigger_mode": "apogee",
+  "trigger_altitude_m": 100.0,
+  "trigger_time_s": 8.0,
+  "deployment_lag_s": 0.5,
+  "trigger_sampling_hz": 100.0,
+  "max_time_s": 300.0,
+  "max_time_step_s": 0.05
+}
