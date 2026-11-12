@@ -1,0 +1,43 @@
+# Python environments and generated files
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Local credentials and editor/OS settings
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Original calculation workbooks remain local input documents
+*.xls
+*.xlsx
+*.xlsm
+~$*
+
+# Runtime outputs; the checked-in example_result.* fixture remains versioned
+/results/
+/runs/
+/exports/
+/data/local/
+/result.json
+/result.csv
+/result_events.csv
+/flight_result.json
+/flight_result.csv
+/flight_result_events.csv
+*.log
