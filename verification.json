@@ -1,10 +1,85 @@
 {
-  "date": "2026-11-12",
+  "date": "2026-11-16",
   "engine": "RocketPy 1.13.0",
   "solver": "RK45",
-  "physics_behavior_tests_passed": 8,
-  "headless_viewer_tests_passed": 3,
+  "physics_behavior_tests_passed": 15,
+  "headless_viewer_tests_passed": 10,
+  "total_tests_passed": 35,
+  "test_command": "python -m unittest discover -s tests -v",
   "native_gui_launch_verified": false,
   "windows_launcher_run_verified": false,
-  "note": "Native Tk window creation was blocked by the macOS application-registration restriction in the execution sandbox. The actual numerical engine, chart renderer, seeking and event display logic were exercised. Example inputs are fictional."
+  "note": "Native Tk window creation was blocked by the macOS application-registration restriction in the execution sandbox. The numerical engine, chart renderer, seeking and event display logic were exercised. Overall dimensions follow the requested envelope; other default model inputs remain illustrative.",
+  "current_scenario": {
+    "total_length_m": 0.7,
+    "nozzle_length_m": 0.15,
+    "inner_diameter_m": 0.08,
+    "illustrative_wall_thickness_m": 0.002,
+    "derived_outer_diameter_m": 0.084,
+    "altitude_threshold_enabled": true,
+    "altitude_threshold_agl_m": 80.0,
+    "threshold_is_hard_altitude_cap": false,
+    "mass_aerodynamics_and_thrust_are_illustrative": true
+  },
+  "checked_behaviors": [
+    "First ascending threshold crossing, single command, deployment lag, overshoot, apogee and landing",
+    "Threshold disabled, threshold not reached within a short observation, and AGL at a 725 m ASL launch site",
+    "Automatic CG/inertia, explicit mass-property preservation, legacy outer-radius migration",
+    "GUI cm-to-m round trip, Boolean threshold setting, threshold line, reason and overshoot display",
+    "Headless Matplotlib rendering, seeking and event state logic",
+    "Total mass vs vehicle-only legacy mass, 70 g/default-motor incompatibility and unstable initial model fast rejection",
+    "Spawned worker success, process termination on cancel/timeout, no stale result on restart, unexpected worker exit and GUI control recovery"
+  ],
+  "numerical_step_consistency": {
+    "configuration": "70 cm overall including 15 cm nozzle section, 8 cm inner diameter, 80 m AGL virtual command enabled",
+    "max_time_steps_s": [
+      0.05,
+      0.025
+    ],
+    "absolute_apogee_agl_difference_m": 0.0005270987740857436,
+    "absolute_landing_horizontal_difference_m": 0.00013809367258642925,
+    "absolute_landing_time_difference_s": 6.84284371672561e-05,
+    "command_times_s": [
+      1.8900000000000001,
+      1.8900000000000001
+    ],
+    "coarser_step_example": {
+      "command_altitude_agl_m": 80.4336013249378,
+      "apogee_agl_m": 131.04506371369425,
+      "landing_time_s": 21.198033273714113
+    },
+    "limitation": "Numerical step-size consistency for this example only; not measured physical accuracy."
+  },
+  "unverified_or_limited": [
+    "Native Tk window creation was not verified; the previously observed macOS sandbox RegisterApplication restriction remains documented.",
+    "Windows launcher execution and performance on the user's Ryzen PC were not measured.",
+    "The no-parachute unreached-threshold test covers only a 6 s observation; complete unrecovered descent and reversed-flow/tumbling behavior were not validated.",
+    "A full-deployment event before motor burnout uses RocketPy's 3DOF dry-mass recovery model without continuing thrust or remaining propellant dynamics.",
+    "The illustrative model does not validate an actual sensor-based flight computer, ejection mechanism, structural design or real landing accuracy."
+  ],
+  "gitignore_checks": {
+    "ignored": 8,
+    "retained": 6,
+    "result": "passed"
+  },
+  "previous_revision_validation": {
+    "date": "2026-11-12",
+    "physics_behavior_tests_passed": 8,
+    "headless_viewer_tests_passed": 3,
+    "note": "Prior 1.5 m fictional example. Its convergence figures are not the current geometry verification."
+  },
+  "macos_launcher_syntax_verified": true,
+  "gitignore_checks_date": "2026-11-12",
+  "mass_regression_tests_passed": 4,
+  "calculation_lifecycle_tests_passed": 6,
+  "mass_input_mode": "GUI: initial total mass including motor and propellant; JSON rocket_mass_kg retains vehicle-only meaning",
+  "wall_clock_timeout_s": 45,
+  "mass_70g_bugfix": {
+    "reported_mass_means": "initial total mass = 0.07 kg",
+    "default_motor_plus_propellant_kg": 0.7,
+    "incompatible_total_mass_rejected": true,
+    "old_vehicle_mass_0_07_unstable_model_rejected_before_integration": true,
+    "default_cli_completed": true,
+    "cancel_timeout_and_worker_exit_tested": true,
+    "remaining_input_needed": "Actual motor dry mass, propellant mass and final thrust-time data for a 70 g whole-rocket model."
+  }
 }

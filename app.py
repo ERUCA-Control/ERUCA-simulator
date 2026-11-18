@@ -6,14 +6,14 @@ import bisect
 import json
 import math
 from pathlib import Path
-import queue
+import multiprocessing as mp
 import sys
-import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from simulation import SimulationConfig, default_config, save_csv, save_json, simulate
+from calculation import CalculationJob
+from simulation import SimulationConfig, default_config, save_csv, save_json, simulate, vehicle_mass_from_total
 
 
 BG = "#0d1521"
@@ -24,7 +24,8 @@ CYAN = "#53d5d2"
 ORANGE = "#ffb45e"
 GRID = "#304155"
 TRIGGERS = {"최고점 통과": "apogee", "하강 중 지정 고도": "descending_altitude", "발사 후 지정 시간": "time"}
-EVENTS = {"launch": "발사 시작", "rail_exit": "레일 이탈", "burnout": "연소 종료", "apogee": "최고점", "parachute_command": "사출 명령", "full_deployment": "전개 반영(모델)", "landing": "착지"}
+CM_FIELDS = {"rocket_length_m", "rocket_inner_diameter_m", "nozzle_length_m"}
+EVENTS = {"launch": "발사 시작", "rail_exit": "레일 이탈", "burnout": "연소 종료", "apogee": "최고점", "altitude_limit_reached": "고도 제한 도달", "parachute_command": "사출 명령", "full_deployment": "전개 반영(모델)", "landing": "착지"}
 PHASES = {"powered_ascent": "추력 비행", "coast_ascent": "관성 상승", "ballistic_descent": "하강", "deployment_delay": "전개 지연", "parachute_descent": "낙하산 강하"}
 
 
@@ -44,13 +45,14 @@ class FlightApp(tk.Tk):
         self.loading = True
         self.vars = {}
         self.entries = {}
-        self.messages = queue.Queue()
+        self.job = CalculationJob()
         self.play_clock = 0.0
         self.last_tick = time.monotonic()
         self._style()
         self._build()
         self._set_config(self.base_config)
         self.loading = False
+        self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(100, self._poll)
         self.after(40, self._tick)
         if autorun:
@@ -94,14 +96,44 @@ class FlightApp(tk.Tk):
 
         tabs = ttk.Notebook(left)
         tabs.pack(fill="both", expand=True, padx=10, pady=10)
-        form = ttk.Frame(tabs)
+        geometry = ttk.Frame(tabs)
+        form_tab = ttk.Frame(tabs)
+        form_canvas = tk.Canvas(form_tab, bg=PANEL, highlightthickness=0, width=290)
+        form_scroll = ttk.Scrollbar(form_tab, orient="vertical", command=form_canvas.yview)
+        form_canvas.configure(yscrollcommand=form_scroll.set)
+        form_scroll.pack(side="right", fill="y")
+        form_canvas.pack(side="left", fill="both", expand=True)
+        form = ttk.Frame(form_canvas)
+        form_window = form_canvas.create_window((0, 0), window=form, anchor="nw")
+        form.bind("<Configure>", lambda _: form_canvas.configure(scrollregion=form_canvas.bbox("all")))
+        form_canvas.bind("<Configure>", lambda e: form_canvas.itemconfigure(form_window, width=e.width))
         advanced = ttk.Frame(tabs)
-        tabs.add(form, text="비행 설정")
-        tabs.add(advanced, text="전체 제원 JSON")
+        tabs.add(geometry, text="치수·고도")
+        tabs.add(form_tab, text="비행 설정")
+        tabs.add(advanced, text="JSON")
+        geometry.columnconfigure(1, weight=1)
+        ttk.Label(geometry, text="로켓 치수", foreground=CYAN, font=(self.font, 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(12, 7))
+        for row, (key, label) in enumerate([
+            ("rocket_length_m", "전체 길이, 노즐 포함 (cm)"),
+            ("rocket_inner_diameter_m", "로켓 내경 (cm)"),
+            ("nozzle_length_m", "노즐부 길이 (cm)"),
+        ], 1):
+            self._field(geometry, row, key, label)
+        self.geometry_info = tk.StringVar()
+        ttk.Label(geometry, textvariable=self.geometry_info, style="Muted.TLabel", wraplength=280, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 3))
+        self.geometry_canvas = tk.Canvas(geometry, width=280, height=142, bg=PANEL, highlightthickness=0)
+        self.geometry_canvas.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 12))
+        self.geometry_canvas.bind("<Configure>", lambda _: self._draw_geometry())
+        ttk.Label(geometry, text="상승 고도 제한", foreground=ORANGE, font=(self.font, 11, "bold")).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        self.altitude_limit_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(geometry, text="제한 고도 도달 시 가상 낙하산 사출", variable=self.altitude_limit_enabled, command=self._limit_changed).grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 8))
+        self._field(geometry, 8, "altitude_limit_m", "제한 고도 AGL (m)")
+        ttk.Label(geometry, text="발사점 지면 기준 높이입니다.\n도달하면 사출을 명령하고 착지까지 계산합니다.\n전개 지연과 관성으로 제한을 넘을 수 있습니다.", style="Muted.TLabel", wraplength=280, justify="left").grid(row=9, column=0, columnspan=2, sticky="w", pady=(10, 9))
+        ttk.Label(geometry, text="비행 설정의 기존 사출 조건도 유지하며,\n먼저 충족된 조건으로 한 번만 명령합니다.", style="Muted.TLabel", wraplength=280, justify="left").grid(row=10, column=0, columnspan=2, sticky="w", pady=(5, 10))
         form.columnconfigure(1, weight=1)
         row = 0
         sections = [
-            ("발사 · 기체", [("rocket_mass_kg", "기체 질량, 모터 제외 (kg)"), ("thrust_scale", "추력곡선 배율"), ("launch_elevation_deg", "발사 고각, 수직 90°"), ("heading_deg", "방위각, 북 0° / 동 90°")]),
+            ("발사 · 기체", [("initial_total_mass_kg", "초기 전체 로켓 질량 (kg)"), ("motor_dry_mass_kg", "모터 건조 질량 (kg)"), ("propellant_mass_kg", "추진제 질량 (kg)"), ("thrust_scale", "추력곡선 배율"), ("launch_elevation_deg", "발사 고각, 수직 90°"), ("heading_deg", "방위각, 북 0° / 동 90°")]),
             ("바람", [("wind_east_mps", "동쪽으로 부는 바람 (m/s)"), ("wind_north_mps", "북쪽으로 부는 바람 (m/s)")]),
         ]
         for title, rows in sections:
@@ -110,6 +142,9 @@ class FlightApp(tk.Tk):
             for key, label in rows:
                 self._field(form, row, key, label)
                 row += 1
+        self.mass_info = tk.StringVar()
+        ttk.Label(form, textvariable=self.mass_info, style="Muted.TLabel", wraplength=260, justify="left").grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 8))
+        row += 1
         ttk.Label(form, text="낙하산", foreground=ORANGE, font=(self.font, 11, "bold")).grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 5))
         row += 1
         ttk.Label(form, text="사출 조건").grid(row=row, column=0, sticky="w", pady=3)
@@ -121,7 +156,7 @@ class FlightApp(tk.Tk):
         for key, label in [("trigger_altitude_m", "하강 사출 고도 AGL (m)"), ("trigger_time_s", "발사 후 사출 시간 (s)"), ("deployment_lag_s", "명령 → 전개 반영 지연 (s)"), ("parachute_cd_s_m2", "낙하산 Cd × 면적 (m²)"), ("max_time_s", "계산 종료 시간 (s)")]:
             self._field(form, row, key, label)
             row += 1
-        ttk.Label(form, text="발사점 위경도·형상·관성·추력곡선은\n전체 제원 JSON에서 수정할 수 있습니다.", style="Muted.TLabel", wraplength=285, justify="left").grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 5))
+        ttk.Label(form, text="기본 치수와 상승 고도 제한은 ‘치수·고도’,\n나머지 제원은 JSON 탭에서 수정합니다.", style="Muted.TLabel", wraplength=285, justify="left").grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 5))
         row += 1
         ttk.Label(form, text="명령 좌표와 전개 반영 좌표를 구분합니다.\n사출 조건은 모델의 고도·시간을 사용합니다.", style="Muted.TLabel", wraplength=285, justify="left").grid(row=row, column=0, columnspan=2, sticky="w", pady=5)
 
@@ -147,7 +182,7 @@ class FlightApp(tk.Tk):
         metrics = ttk.Frame(right)
         metrics.pack(fill="x", padx=12, pady=(12, 4))
         self.metrics = []
-        for title in ["최고 고도 AGL", "사출 명령", "전개 반영(모델)", "착지 수평 거리"]:
+        for title in ["최고 고도 AGL", "사출 명령", "전개 반영(모델)", "착지 수평 거리", "제한 초과량"]:
             cell = tk.Frame(metrics, bg="#1c2d41", padx=12, pady=8)
             cell.pack(side="left", expand=True, fill="both", padx=3)
             tk.Label(cell, text=title, bg="#1c2d41", fg=MUTED, font=(self.font, 10)).pack(anchor="w")
@@ -190,7 +225,10 @@ class FlightApp(tk.Tk):
         for key, title, width in zip(columns, ["이벤트", "시간 s", "동 m", "북 m", "AGL m", "위도 °", "경도 °"], [145, 70, 85, 85, 85, 105, 105]):
             self.table.heading(key, text=title)
             self.table.column(key, width=width, minwidth=55, anchor="w" if key == "event" else "e", stretch=True)
-        self.table.pack(fill="x")
+        table_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
+        self.table.configure(yscrollcommand=table_scroll.set)
+        self.table.pack(side="left", fill="x", expand=True)
+        table_scroll.pack(side="right", fill="y")
         self.table.tag_configure("parachute", foreground=ORANGE)
         self.table.bind("<<TreeviewSelect>>", self._select_event)
         ttk.Label(right, text="AGL: 발사점 지면 기준 · 위경도: 국소 근사 · 낙하산 전개 후 자세 표시는 제공하지 않습니다.", style="Muted.TLabel").pack(anchor="w", padx=16, pady=(0, 10))
@@ -207,6 +245,58 @@ class FlightApp(tk.Tk):
     def _dirty(self, *_):
         if not self.loading and not self.busy:
             self.status.set("입력이 변경되었습니다. ‘비행 계산’을 눌러 반영하세요.")
+        if not self.loading and getattr(self, "geometry_canvas", None) is not None:
+            self._draw_geometry()
+        if not self.loading and getattr(self, "mass_info", None) is not None:
+            self._update_mass_info()
+
+    def _update_mass_info(self):
+        try:
+            total, dry, propellant = (float(self.vars[key].get()) for key in ("initial_total_mass_kg", "motor_dry_mass_kg", "propellant_mass_kg"))
+            vehicle = vehicle_mass_from_total(total, dry, propellant)
+            self.mass_info.set(f"전체 {total:g} = 기체 {vehicle:g} + 모터 {dry:g} + 추진제 {propellant:g} kg")
+        except (ValueError, KeyError):
+            self.mass_info.set("전체 질량은 모터와 추진제 합계보다 커야 합니다. 세 질량을 모두 확인하세요.")
+
+    def _draw_geometry(self):
+        """Dimension sketch only: the rear section does not model nozzle flow."""
+        canvas = self.geometry_canvas
+        canvas.delete("all")
+        try:
+            length, inner, nozzle = (float(self.vars[key].get()) for key in ("rocket_length_m", "rocket_inner_diameter_m", "nozzle_length_m"))
+            wall_cm = float(self.base_config.get("body_wall_thickness_m", 0.002)) * 100
+            outer = inner + 2 * wall_cm
+            if (
+                not all(math.isfinite(v) and v > 0 for v in (length, inner, nozzle, outer))
+                or not math.isfinite(wall_cm) or wall_cm < 0
+                or length <= 4 * outer or length - nozzle <= 2 * outer
+            ):
+                raise ValueError
+        except (ValueError, TypeError):
+            self.geometry_info.set("전체 길이·내경·노즐부 입력을 확인하세요.")
+            return
+        width = max(canvas.winfo_width(), 280)
+        start, end, mid = 22, width - 22, 68
+        scale = (end - start) / length
+        half = min(outer * scale / 2, 27)
+        nose_base = end - (length - nozzle) * .2 * scale
+        nozzle_end = start + nozzle * scale
+        canvas.create_rectangle(start, mid-half, nose_base, mid+half, outline=CYAN, fill="#1c3549", width=2)
+        canvas.create_polygon(nose_base, mid-half, end, mid, nose_base, mid+half, outline=CYAN, fill="#1c3549", width=2)
+        canvas.create_rectangle(start, mid-half, nozzle_end, mid+half, outline=ORANGE, fill="#584330", width=2)
+        inner_half = half * inner / outer
+        for y in (mid-inner_half, mid+inner_half):
+            canvas.create_line(nozzle_end, y, nose_base, y, fill=MUTED, dash=(3, 3))
+        canvas.create_line(start, 19, end, 19, fill=MUTED, arrow="both")
+        canvas.create_text(width/2, 7, text=f"전체 {length:g} cm", fill=FG, font=(self.font, 10))
+        canvas.create_line(start, 111, nozzle_end, 111, fill=ORANGE, arrow="both")
+        canvas.create_text((start+nozzle_end)/2, 128, text=f"노즐부 {nozzle:g} cm", fill=ORANGE, font=(self.font, 9))
+        canvas.create_text((nozzle_end+nose_base)/2, mid, text=f"내경 {inner:g} cm", fill=FG, font=(self.font, 9))
+        self.geometry_info.set(f"노즐부는 전체 길이에 포함됩니다.\n외경 {outer:g} cm · 벽 두께 {wall_cm:g} cm 가정(JSON에서 변경)")
+
+    def _limit_changed(self, *_):
+        self.entries["altitude_limit_m"].configure(state="normal" if self.altitude_limit_enabled.get() else "disabled")
+        self._dirty()
 
     def _trigger_changed(self, *_):
         mode = TRIGGERS.get(self.trigger.get(), "apogee")
@@ -220,11 +310,14 @@ class FlightApp(tk.Tk):
         self.base_config = asdict(cfg)
         self.loading = True
         for key, var in self.vars.items():
-            var.set(str(self.base_config[key]))
+            value = cfg.rocket_mass_kg + cfg.motor_dry_mass_kg + cfg.propellant_mass_kg if key == "initial_total_mass_kg" else self.base_config[key]
+            var.set(f"{value * 100:g}" if key in CM_FIELDS else str(value))
+        self.altitude_limit_enabled.set(cfg.altitude_limit_enabled)
         self.trigger.set(next(label for label, mode in TRIGGERS.items() if mode == cfg.trigger_mode))
         self._write_json(self.base_config)
         self.loading = False
         self._trigger_changed()
+        self._limit_changed()
         self.status.set("설정을 불러왔습니다. 비행 계산으로 결과를 갱신하세요.")
 
     def _write_json(self, config):
@@ -235,10 +328,18 @@ class FlightApp(tk.Tk):
         config = dict(self.base_config)
         for key, var in self.vars.items():
             try:
-                config[key] = float(var.get())
+                if key != "initial_total_mass_kg":
+                    config[key] = float(var.get()) / (100 if key in CM_FIELDS else 1)
             except ValueError as error:
                 raise ValueError(f"{key}: 숫자를 입력하세요.") from error
+        if "initial_total_mass_kg" in self.vars:
+            try:
+                total_mass = float(self.vars["initial_total_mass_kg"].get())
+            except ValueError as error:
+                raise ValueError("초기 전체 로켓 질량: kg 단위 숫자를 입력하세요.") from error
+            config["rocket_mass_kg"] = vehicle_mass_from_total(total_mass, config["motor_dry_mass_kg"], config["propellant_mass_kg"])
         config["trigger_mode"] = TRIGGERS[self.trigger.get()]
+        config["altitude_limit_enabled"] = self.altitude_limit_enabled.get()
         SimulationConfig.from_dict(config)
         return config
 
@@ -269,38 +370,48 @@ class FlightApp(tk.Tk):
 
     def calculate(self):
         if self.busy:
+            self.job.cancel()
+            self.busy = False
+            self.run_button.configure(text="비행 계산", state="normal")
+            self.status.set("계산을 취소했습니다. 제원을 수정한 뒤 다시 계산할 수 있습니다.")
             return
         try:
             config = self.read_config()
         except ValueError as error:
+            self.status.set("입력 오류 · 새 비행 결과를 만들지 않았습니다.")
             messagebox.showerror("입력 오류", str(error), parent=self)
             return
         self.playing = False
         self.busy = True
-        self.run_button.configure(text="계산 중…", state="disabled")
+        self.run_button.configure(text="계산 취소", state="normal")
         self.status.set("비행 궤적과 낙하산 사출 좌표를 계산하고 있습니다…")
         self._write_json(config)
-        def worker():
-            try:
-                self.messages.put(("result", simulate(config)))
-            except Exception as error:
-                self.messages.put(("error", f"{type(error).__name__}: {error}"))
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            self.job.start(config)
+        except Exception as error:
+            self.busy = False
+            self.run_button.configure(text="비행 계산", state="normal")
+            self.status.set("계산 프로세스를 시작하지 못했습니다.")
+            messagebox.showerror("계산 시작 오류", str(error), parent=self)
 
     def _poll(self):
-        try:
-            kind, value = self.messages.get_nowait()
-        except queue.Empty:
-            pass
-        else:
+        response = self.job.poll()
+        if response is not None:
+            kind, value = response
             self.busy = False
             self.run_button.configure(text="비행 계산", state="normal")
             if kind == "result":
                 self.accept_result(value)
             else:
-                self.status.set("계산을 완료하지 못했습니다. 입력과 실행 환경을 확인하세요.")
+                self.status.set("계산을 완료하지 못했습니다. 새 결과가 없으며 기존 화면은 이전 계산 결과입니다.")
                 messagebox.showerror("계산 오류", value, parent=self)
+        elif self.busy:
+            self.status.set(f"비행 계산 중 · 실제 경과 {self.job.elapsed_s:.1f} s / 제한 {self.job.timeout_s:g} s · ‘계산 취소’ 가능")
         self.after(100, self._poll)
+
+    def close(self):
+        self.job.cancel()
+        self.destroy()
 
     def accept_result(self, result):
         self.result = result
@@ -314,9 +425,12 @@ class FlightApp(tk.Tk):
         self.metrics[2].configure(text=altitude("full_deployment"))
         landing_range = result.summary["landing_range_m"]
         self.metrics[3].configure(text=f"{landing_range:,.1f} m" if landing_range is not None else "미도달")
+        if len(self.metrics) > 4:
+            overshoot = result.summary.get("altitude_limit_overshoot_m", result.summary.get("overshoot_m", 0))
+            self.metrics[4].configure(text=f"{overshoot:,.1f} m" if result.config.get("altitude_limit_enabled", False) else "사용 안 함")
         self.table.delete(*self.table.get_children())
         for i, event in enumerate(result.events):
-            self.table.insert("", "end", iid=str(i), values=(EVENTS.get(event["type"], event["type"]), f"{event['t_s']:.2f}", f"{event['east_m']:.1f}", f"{event['north_m']:.1f}", f"{event['altitude_agl_m']:.1f}", f"{event['latitude_deg']:.6f}", f"{event['longitude_deg']:.6f}"), tags=("parachute",) if event["type"] in {"parachute_command", "full_deployment"} else ())
+            self.table.insert("", "end", iid=str(i), values=(EVENTS.get(event["type"], event["type"]), f"{event['t_s']:.2f}", f"{event['east_m']:.1f}", f"{event['north_m']:.1f}", f"{event['altitude_agl_m']:.1f}", f"{event['latitude_deg']:.6f}", f"{event['longitude_deg']:.6f}"), tags=("parachute",) if event["type"] in {"parachute_command", "full_deployment", "altitude_limit_reached"} else ())
         self.slider.configure(to=result.summary["duration_s"])
         self.export_button.configure(state="normal")
         self._draw_flight()
@@ -325,7 +439,10 @@ class FlightApp(tk.Tk):
         self.seek(0)
         end = "착지까지 계산 완료" if result.summary["landed"] else "설정된 종료 시간 도달 · 착지 미도달"
         deployment = {"deployed": "낙하산 전개 반영", "pending_at_end": "전개 지연 중 종료", "not_triggered": "사출 조건 미도달"}[result.summary["deployment_status"]]
-        self.status.set(f"{end} / {deployment} / 계산 구간 {result.summary['duration_s']:.1f} s")
+        reason = " · 고도 제한으로 사출" if result.summary.get("command_reason") == "altitude_limit" else ""
+        if result.summary.get("powered_deployment_unsupported", False):
+            reason += " · 연소 중 전개: 단순 회수 모델"
+        self.status.set(f"{end} / {deployment}{reason} / 계산 구간 {result.summary['duration_s']:.1f} s")
         self.notice.configure(text=f"제원: {result.config['label']}  ·  실제 기체의 제원·실측자료 적용 전에는 예측 성능을 보장하지 않습니다.")
 
     def _axes_style(self, ax):
@@ -347,6 +464,13 @@ class FlightApp(tk.Tk):
         for ax in [self.ax3, self.axh, self.axmap]:
             self._axes_style(ax)
         self.figure.subplots_adjust(left=0.06, right=0.94, top=0.92, bottom=0.12)
+        config = self.result.config
+        if all(key in config for key in CM_FIELDS):
+            self.figure.text(
+                .5, .995,
+                f"Total length {config['rocket_length_m']*100:g} cm (nozzle included)  |  ID {config['rocket_inner_diameter_m']*100:g} cm  |  Nozzle section {config['nozzle_length_m']*100:g} cm",
+                ha="center", va="top", color=MUTED, fontsize=8,
+            )
         points = self.result.samples
         self.x = [p["east_m"] for p in points]
         self.y = [p["north_m"] for p in points]
@@ -373,6 +497,10 @@ class FlightApp(tk.Tk):
         self.axh.set_title("Altitude & speed", fontsize=11)
         self.axh.set_xlabel("Time (s)")
         self.axh.set_ylabel("AGL (m)")
+        if self.result.config.get("altitude_limit_enabled", False):
+            limit = self.result.config["altitude_limit_m"]
+            self.axh.axhline(limit, color=ORANGE, linestyle="--", linewidth=1, label=f"Deployment limit: {limit:g} m AGL")
+            self.axh.legend(loc="lower left", fontsize=7, frameon=False, labelcolor=ORANGE)
         self.speed_ax = self.axh.twinx()
         self.speed_ax.plot(self.times, [p["speed_mps"] for p in points], color="#a3a0ee", lw=1, alpha=0.75)
         self.speed_ax.set_ylabel("Speed (m/s)", color="#a3a0ee", fontsize=9)
@@ -472,6 +600,7 @@ class FlightApp(tk.Tk):
 
 
 def main():
+    mp.freeze_support()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--preview", type=Path)

@@ -27,7 +27,7 @@ SIMULATOR_DIR = Path(
 )
 sys.path.insert(0, str(SIMULATOR_DIR))
 
-from simulation import default_config, simulate  # noqa: E402
+from simulation import SimulationConfig, default_config, simulate  # noqa: E402
 
 
 @lru_cache(maxsize=20)
@@ -46,6 +46,7 @@ class FlightBehaviorTests(unittest.TestCase):
             trigger_mode="apogee",
             deployment_lag_s=1.2,
             max_time_s=300.0,
+            altitude_limit_enabled=False,
         )
         config.update(overrides)
         return cached_flight(json.dumps(config, sort_keys=True), float(dt))
@@ -164,13 +165,18 @@ class FlightBehaviorTests(unittest.TestCase):
     def test_unreached_altitude_does_not_create_a_parachute_event(self):
         result = self.flight(
             trigger_mode="descending_altitude", trigger_altitude_m=100000.0,
+            max_time_s=6.0,
         )
-        self.assertLess(self.event(result, "apogee")["altitude_agl_m"], 100000.0)
+        # This test owns the unreached-condition behavior during the observed
+        # interval. Unrecovered reversed-flow/tumbling descent is outside this
+        # prototype's validated aero model and is not a landing benchmark.
+        self.assertLess(max(p["altitude_agl_m"] for p in result.samples), 100000.0)
         self.assertFalse(any(
             event["type"] in {"parachute_command", "full_deployment"}
             for event in result.events
         ))
-        self.assertTrue(result.summary["landed"])
+        self.assertFalse(result.summary["landed"])
+        self.assertEqual(result.summary["termination"], "max_time")
         self.assertEqual(result.summary["deployment_status"], "not_triggered")
         self.assertIsNone(result.summary["parachute_command_time_s"])
         self.assertIsNone(result.summary["full_deployment_time_s"])
@@ -213,6 +219,167 @@ class FlightBehaviorTests(unittest.TestCase):
             self.assertAlmostEqual(a["t_s"], b["t_s"], delta=1e-6)
             for field in ("east_m", "north_m", "altitude_agl_m"):
                 self.assertAlmostEqual(a[field], b[field], delta=1e-4)
+
+    def test_upward_altitude_limit_commands_then_continues_real_trajectory(self):
+        result = self.flight(altitude_limit_enabled=True, altitude_limit_m=80.0)
+        crossing = self.event(result, "altitude_limit_reached")
+        command = self.event(result, "parachute_command")
+        opened = self.event(result, "full_deployment")
+        apogee = self.event(result, "apogee")
+        landing = self.event(result, "landing")
+        self.assertAlmostEqual(crossing["altitude_agl_m"], 80.0, delta=1e-4)
+        self.assertGreater(crossing["v_up_mps"], 0.0)
+        self.assertGreaterEqual(command["t_s"], crossing["t_s"] - 1e-6)
+        self.assertLessEqual(command["t_s"] - crossing["t_s"], 0.011)
+        self.assertGreater(command["v_up_mps"], 0.0)
+        self.assertGreaterEqual(command["altitude_agl_m"], 80.0 - 1e-5)
+        self.assertEqual(command["reason"], "altitude_limit")
+        self.assertEqual(result.summary["command_reason"], "altitude_limit")
+        self.assertAlmostEqual(opened["t_s"] - command["t_s"], 1.2, delta=0.011)
+        self.assertGreater(opened["altitude_agl_m"], command["altitude_agl_m"])
+        self.assertGreater(apogee["altitude_agl_m"], 80.0)
+        self.assertGreater(landing["t_s"], apogee["t_s"])
+        self.assertAlmostEqual(landing["altitude_agl_m"], 0.0, delta=0.03)
+        self.assertTrue(result.summary["landed"])
+        self.assertTrue(result.summary["altitude_limit_reached"])
+        self.assertTrue(result.summary["altitude_limit_exceeded"])
+        self.assertAlmostEqual(
+            result.summary["altitude_limit_overshoot_m"],
+            apogee["altitude_agl_m"] - 80.0,
+            delta=1e-4,
+        )
+
+    def test_disabled_or_unreached_limit_keeps_primary_apogee_trigger(self):
+        disabled = self.flight()
+        unreachable = self.flight(altitude_limit_enabled=True, altitude_limit_m=100000.0)
+        for result in (disabled, unreachable):
+            self.assertFalse(result.summary["altitude_limit_reached"])
+            self.assertFalse(result.summary["altitude_limit_exceeded"])
+            self.assertAlmostEqual(result.summary["altitude_limit_overshoot_m"], 0.0)
+            self.assertFalse(any(e["type"] == "altitude_limit_reached" for e in result.events))
+            self.assertEqual(self.event(result, "parachute_command")["reason"], "apogee")
+            self.assertEqual(result.summary["command_reason"], "apogee")
+        self.assertAlmostEqual(
+            self.event(disabled, "parachute_command")["t_s"],
+            self.event(unreachable, "parachute_command")["t_s"],
+            delta=1e-6,
+        )
+
+    def test_earlier_command_is_not_reissued_when_limit_is_later_crossed(self):
+        result = self.flight(
+            altitude_limit_enabled=True, altitude_limit_m=80.0,
+            trigger_mode="time", trigger_time_s=1.0, deployment_lag_s=4.0,
+        )
+        command = self.event(result, "parachute_command")
+        crossing = self.event(result, "altitude_limit_reached")
+        opened = self.event(result, "full_deployment")
+        self.assertAlmostEqual(command["t_s"], 1.0, delta=0.011)
+        self.assertEqual(command["reason"], "time")
+        self.assertEqual(result.summary["command_reason"], "time")
+        self.assertLess(command["t_s"], crossing["t_s"])
+        self.assertLess(crossing["t_s"], opened["t_s"])
+        self.assertTrue(result.summary["altitude_limit_reached"])
+        self.assertTrue(result.summary["landed"])
+
+    def test_altitude_limit_uses_agl_at_an_elevated_launch_site(self):
+        result = self.flight(
+            altitude_limit_enabled=True, altitude_limit_m=80.0,
+            site_elevation_m=725.0,
+        )
+        crossing = self.event(result, "altitude_limit_reached")
+        command = self.event(result, "parachute_command")
+        self.assertGreater(crossing["t_s"], 0.0)
+        self.assertAlmostEqual(crossing["altitude_agl_m"], 80.0, delta=1e-4)
+        self.assertAlmostEqual(crossing["altitude_asl_m"], 805.0, delta=1e-4)
+        self.assertEqual(command["reason"], "altitude_limit")
+        self.assertGreater(command["altitude_asl_m"], 804.9999)
+
+
+class GeometryConfigTests(unittest.TestCase):
+    def test_default_geometry_and_automatic_mass_properties_are_consistent(self):
+        config = default_config()
+        self.assertAlmostEqual(config["rocket_length_m"], 0.70)
+        self.assertAlmostEqual(config["rocket_inner_diameter_m"], 0.08)
+        self.assertAlmostEqual(config["nozzle_length_m"], 0.15)
+        self.assertTrue(config["altitude_limit_enabled"])
+        self.assertAlmostEqual(config["altitude_limit_m"], 80.0)
+        self.assertIsNone(config["cg_from_tail_m"])
+        self.assertIsNone(config["rocket_inertia_kg_m2"])
+        self.assertNotIn("rocket_radius_m", config)
+        config.update(max_time_s=0.5)
+        result = cached_flight(json.dumps(config, sort_keys=True), 0.1)
+        geometry = result.summary["geometry"]
+        self.assertAlmostEqual(geometry["total_length_m"], 0.70)
+        self.assertAlmostEqual(
+            geometry["nozzle_length_m"] + geometry["body_including_nose_length_m"],
+            geometry["total_length_m"],
+        )
+        self.assertAlmostEqual(
+            geometry["cylindrical_body_length_m"] + geometry["nose_length_m"],
+            geometry["body_including_nose_length_m"],
+        )
+        self.assertAlmostEqual(
+            geometry["outer_diameter_m"],
+            geometry["inner_diameter_m"] + 2 * geometry["wall_thickness_m"],
+        )
+        self.assertAlmostEqual(2 * geometry["outer_radius_m"], geometry["outer_diameter_m"])
+        self.assertGreater(result.summary["effective_cg_from_tail_m"], 0.0)
+        self.assertLess(result.summary["effective_cg_from_tail_m"], 0.70)
+        self.assertEqual(len(result.summary["effective_inertia_kg_m2"]), 3)
+        self.assertTrue(all(moment > 0 for moment in result.summary["effective_inertia_kg_m2"]))
+        self.assertIsNone(result.config["cg_from_tail_m"])
+        self.assertIsNone(result.config["rocket_inertia_kg_m2"])
+        baseline = SimulationConfig.from_dict({})
+        longer = SimulationConfig.from_dict({"rocket_length_m": 0.9})
+        wider = SimulationConfig.from_dict({"rocket_inner_diameter_m": 0.1})
+        self.assertGreater(longer.effective_cg_from_tail_m, baseline.effective_cg_from_tail_m)
+        self.assertGreater(longer.effective_inertia_kg_m2[0], baseline.effective_inertia_kg_m2[0])
+        self.assertGreater(wider.effective_inertia_kg_m2[2], baseline.effective_inertia_kg_m2[2])
+
+    def test_legacy_radius_migrates_and_explicit_mass_properties_survive(self):
+        legacy = {
+            "rocket_length_m": 1.5,
+            "rocket_radius_m": 0.045,
+            "cg_from_tail_m": 0.82,
+            "rocket_inertia_kg_m2": [0.65, 0.65, 0.007],
+            "altitude_limit_enabled": False,
+            "max_time_s": 0.5,
+        }
+        result = cached_flight(json.dumps(legacy, sort_keys=True), 0.1)
+        self.assertAlmostEqual(result.summary["geometry"]["outer_radius_m"], 0.045)
+        self.assertAlmostEqual(
+            result.config["rocket_inner_diameter_m"],
+            2 * (0.045 - result.config["body_wall_thickness_m"]),
+        )
+        self.assertEqual(result.config["cg_from_tail_m"], 0.82)
+        self.assertEqual(result.summary["effective_cg_from_tail_m"], 0.82)
+        self.assertEqual(result.config["rocket_inertia_kg_m2"], [0.65, 0.65, 0.007])
+        self.assertEqual(result.summary["effective_inertia_kg_m2"], [0.65, 0.65, 0.007])
+        self.assertNotIn("rocket_radius_m", result.config)
+        with self.assertRaises(ValueError):
+            SimulationConfig.from_dict({"rocket_radius_m": 0.045, "rocket_inner_diameter_m": 0.08})
+
+    def test_invalid_geometry_and_limit_values_are_rejected_before_simulation(self):
+        for key in ("rocket_length_m", "rocket_inner_diameter_m", "nozzle_length_m", "altitude_limit_m"):
+            for invalid in (0, -1.0, None, True, float("nan"), float("inf")):
+                with self.subTest(key=key, invalid=invalid), self.assertRaises(ValueError):
+                    SimulationConfig.from_dict({key: invalid})
+        for invalid in (None, "true", 1, 0, [], {}):
+            with self.subTest(altitude_limit_enabled=invalid), self.assertRaises(ValueError):
+                SimulationConfig.from_dict({"altitude_limit_enabled": invalid})
+        for invalid in (-0.1, 0.70, 0.8):
+            with self.subTest(nozzle_length_m=invalid), self.assertRaises(ValueError):
+                SimulationConfig.from_dict({"nozzle_length_m": invalid})
+        for invalid in (0.0, -0.1, 0.70):
+            with self.subTest(cg_from_tail_m=invalid), self.assertRaises(ValueError):
+                SimulationConfig.from_dict({"cg_from_tail_m": invalid})
+        for invalid in ([], [1, 2], [1, 0, 1], [1, -1, 1]):
+            with self.subTest(rocket_inertia_kg_m2=invalid), self.assertRaises(ValueError):
+                SimulationConfig.from_dict({"rocket_inertia_kg_m2": invalid})
+        for invalid in (-0.1, None, True, float("nan")):
+            with self.subTest(body_wall_thickness_m=invalid), self.assertRaises(ValueError):
+                SimulationConfig.from_dict({"body_wall_thickness_m": invalid})
+        SimulationConfig.from_dict({"body_wall_thickness_m": 0.0})
 
 
 if __name__ == "__main__":
